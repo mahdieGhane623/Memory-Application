@@ -1,0 +1,16 @@
+{
+  "indexes": [
+    {
+      "name": "vectorSearchIndex",
+      "key": {
+        "embedding": "cosmosSearch"
+      },
+      "cosmosSearchOptions": {
+        "kind": "vector-ivf",
+        "numLists": 100,
+        "similarity": "COS",
+        "dimensions": 384
+      }
+    }
+  ]
+}
