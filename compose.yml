@@ -1,0 +1,24 @@
+version: '3.8'
+services:
+  memory-service:
+    build: .
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - LOCAL_DATA_DIR=/app/data
+      - LT_MEMORY_SECRET=dev-secret
+      - MAX_DIRECT_PAYLOAD_BYTES=65536
+
+  # optional minio (S3-compatible) if you prefer; memory service above doesn't use it by default
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./minio_data:/data
