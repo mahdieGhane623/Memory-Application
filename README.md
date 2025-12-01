@@ -552,28 +552,17 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📖 Citation
 
-If you use this implementation in your research, please cite:
+A-mem system has been used as a backbone of our memory agent. you can find it here:
 
 ```bibtex
-@inproceedings{amems2025,
-  title={A-Mems: Agentic Memory Systems for Long-Context Reasoning},
-  author={[Authors]},
-  booktitle={Advances in Neural Information Processing Systems},
-  year={2025},
-  url={https://neurips.cc/}
+@article{xu2025mem,
+  title={A-mem: Agentic memory for llm agents},
+  author={Xu, Wujiang and Liang, Zujie and Mei, Kai and Gao, Hang and Tan, Juntao and Zhang, Yongfeng},
+  journal={arXiv preprint arXiv:2502.12110},
+  year={2025}
 }
 ```
 
-And this implementation:
-
-```bibtex
-@software{agentic_memory_service2025,
-  title={Agentic Memory Service with Azure AI Search},
-  author={[Your Name]},
-  year={2025},
-  url={https://github.com/yourusername/agentic-memory-service}
-}
-```
 
 ---
 
@@ -593,36 +582,3 @@ And this implementation:
 - **Issues:** [GitHub Issues](https://github.com/yourusername/agentic-memory-service/issues)
 - **Discussions:** [GitHub Discussions](https://github.com/yourusername/agentic-memory-service/discussions)
 
----
-
-## 🗺️ Roadmap
-
-### v1.1 (Q1 2025)
-- [ ] Multi-tenancy support
-- [ ] Redis caching layer
-- [ ] Batch memory operations
-- [ ] Webhook notifications
-
-### v1.2 (Q2 2025)
-- [ ] LightRAG integration
-- [ ] Knowledge graph visualization
-- [ ] Advanced analytics dashboard
-- [ ] Multi-language support
-
-### v2.0 (Q3 2025)
-- [ ] Federated learning for privacy
-- [ ] On-premise deployment option
-- [ ] GraphQL API
-- [ ] Mobile SDK
-
----
-
-## ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/agentic-memory-service&type=Date)](https://star-history.com/#yourusername/agentic-memory-service&Date)
-
----
-
-**Built with ❤️ using A-Mems framework and Azure AI**
-
-[⬆ Back to Top](#agentic-memory-service-with-azure-ai-search)
