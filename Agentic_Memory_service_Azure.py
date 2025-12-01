@@ -14,6 +14,8 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from pathlib import Path
 import os
+import json
+import textwrap
 
 # Azure imports
 from azure.search.documents import SearchClient
@@ -1013,7 +1015,7 @@ class OptimizeOnboardToMatchRequest(BaseModel):
     selectors: Optional[List[str]] = None      # list of metadata keys to keep verbatim (e.g. ["customer","intent","id"])
     top_k: int = 8                             # how many candidate memories to retrieve
     summarize: bool = True
-    summary_max_tokens: int = 120
+    summary_max_tokens: int = 1000
     # If you want the matching agent to only see relevant grants:
     grant_only: bool = True
     grant_relevance_threshold: float = 0.6     # 0-1 (higher = stricter). Uses normalized score/distance heuristic.
@@ -1024,36 +1026,238 @@ class OptimizeMatchToOnboardRequest(BaseModel):
     selectors: Optional[List[str]] = None
     top_k: int = 8
     summarize: bool = True
-    summary_max_tokens: int = 120
-def _call_llm_summarize(text: str, max_tokens: int = 120) -> str:
-    """Use the memory_system LLM; fallback to short truncation summarizer when LLM fails."""
-    try:
-        llm = getattr(memory_system, "llm_controller", None)
-        if llm and getattr(llm, "llm", None):
-            # adapt to your llm controller API already used in file
-            prompt = f"Summarize briefly (max {max_tokens} tokens):\n\n{text}"
-            try:
-                # preferred interface used elsewhere in your file:
-                response = memory_system.llm_controller.llm.get_completion(prompt)
-            except Exception:
-                # some controllers accept call like llm(prompt)
-                response = memory_system.llm_controller.llm(prompt)
-            # ensure string
-            if isinstance(response, dict):
-                # some clients return {'text': '...'}
-                return response.get("text") or response.get("content") or str(response)
-            return str(response)
-    except Exception as e:
-        # fall back
-        pass
+    summary_max_tokens: int = 1000
 
-    # fallback simple summarization (safe, non-LLM)
-    text = text.strip()
-    if not text:
+def _call_llm_summarize(items, max_tokens) -> str:
+    """
+    Summarize grant items using LLM with robust error handling.
+    Creates detailed summaries of each grant's key points.
+    """
+    if not items:
         return ""
-    if len(text) > 400:
-        return text[:400].rsplit('.', 1)[0] + "..."
-    return text
+    
+    if not isinstance(items, list):
+        items = [items]
+    
+    # Filter out empty items and duplicates
+    seen_ids = set()
+    unique_items = []
+    for item in items:
+        if not item or not isinstance(item, dict):
+            continue
+        # Use grant_id to detect duplicates
+        grant_id = item.get("grant_id") or item.get("id")
+        if grant_id and grant_id in seen_ids:
+            continue
+        seen_ids.add(grant_id)
+        unique_items.append(item)
+    
+    items = unique_items
+    
+    if not items:
+        return ""
+    
+    # Build detailed grant descriptions with key points
+    grant_summaries = []
+    
+    for idx, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        
+        parts = []
+        
+        # Header with grant name
+        grant_name = item.get("grant_name", "Unknown Grant")
+        parts.append(f"GRANT {idx}: {grant_name}")
+        
+        # Basic info
+        if item.get("grant_id"):
+            parts.append(f"ID: {item['grant_id']}")
+        if item.get("agency"):
+            parts.append(f"Agency: {item['agency']}")
+        
+        # Funding details
+        if item.get("amount"):
+            amt = item['amount']
+            if isinstance(amt, (int, float)):
+                parts.append(f"Funding: ${amt:,}")
+            else:
+                parts.append(f"Funding: {amt}")
+        
+        if item.get("deadline"):
+            parts.append(f"Deadline: {item['deadline']}")
+        
+        # Key description points - this is crucial!
+        if item.get("description"):
+            desc = str(item["description"])
+            # Truncate but keep enough for meaningful summary
+            if len(desc) > 600:
+                desc = desc[:597] + "..."
+            parts.append(f"Description: {desc}")
+        
+        # Eligibility - important for matching
+        if item.get("eligibility_criteria"):
+            elig = str(item["eligibility_criteria"])
+            if len(elig) > 400:
+                elig = elig[:397] + "..."
+            parts.append(f"Eligibility: {elig}")
+        
+        # Focus areas - helps with relevance
+        if item.get("focus_areas") and isinstance(item["focus_areas"], list):
+            areas = item["focus_areas"][:7]  # Up to 7 areas
+            parts.append(f"Focus Areas: {', '.join(str(a) for a in areas)}")
+        
+        # Required documents (useful to know)
+        if item.get("required_documents") and isinstance(item["required_documents"], list):
+            docs = item["required_documents"][:5]
+            parts.append(f"Key Documents: {', '.join(str(d) for d in docs)}")
+        
+        # Match reasoning (if from matching results)
+        if item.get("match_reasoning"):
+            reasoning = str(item["match_reasoning"])
+            if len(reasoning) > 300:
+                reasoning = reasoning[:297] + "..."
+            parts.append(f"Match Reasoning: {reasoning}")
+        
+        # Customer/intent notes
+        if item.get("customer"):
+            parts.append(f"Customer: {item['customer']}")
+        if item.get("intent"):
+            parts.append(f"Intent: {item['intent']}")
+        if item.get("notes"):
+            notes = str(item["notes"])
+            if len(notes) > 200:
+                notes = notes[:197] + "..."
+            parts.append(f"Notes: {notes}")
+        
+        grant_summaries.append("\n".join(parts))
+    
+    if not grant_summaries:
+        return "No grant information available to summarize."
+    
+    full_text = "\n\n" + "="*80 + "\n\n".join(grant_summaries)
+    
+    # Enhanced LLM prompt for detailed summaries
+    prompt = f"""You are summarizing ADDITIONAL grant opportunities for a matching agent. These grants passed the relevance threshold but were not in the top matches.
+
+For EACH grant below, provide a concise but informative summary that includes:
+1. Grant name and funding amount
+2. What the grant supports (main purpose from description)
+3. Key eligibility requirements
+4. Most relevant focus areas
+5. Important deadlines or notes
+
+Make each grant summary 2-3 sentences. Use bullet points with grant names as headers.
+
+GRANTS TO SUMMARIZE:
+{full_text}
+
+Format your response as:
+
+Additionally, {len(items)} other relevant grant opportunities were identified:
+
+• **[Grant Name]** ($XXX,XXX) - [2-3 sentence summary including purpose, eligibility, focus areas, deadline]
+
+• **[Grant Name 2]** ($XXX,XXX) - [2-3 sentence summary...]
+
+Maximum {max_tokens} tokens total.
+
+Summary:"""
+    
+    # Call LLM
+    try:
+        llm = memory_system.llm_controller.llm
+        
+        logger.info(f"Calling LLM to summarize {len(items)} grants...")
+        
+        # Try different call signatures
+        try:
+            response = llm.get_completion(prompt, max_tokens=max_tokens)
+        except TypeError:
+            try:
+                response = llm.get_completion(prompt)
+            except TypeError:
+                if callable(llm):
+                    response = llm(prompt)
+                else:
+                    raise Exception("Could not determine LLM call signature")
+        
+        logger.info(f"LLM response type: {type(response)}")
+        
+        # Extract text from various response formats
+        if isinstance(response, dict):
+            text = (response.get("text") or 
+                   response.get("content") or 
+                   response.get("result") or 
+                   response.get("choices", [{}])[0].get("message", {}).get("content") or
+                   str(response))
+        else:
+            text = str(response)
+        
+        result = text.strip()
+        
+        # Remove markdown code blocks if present
+        if result.startswith("```") and result.endswith("```"):
+            lines = result.split("\n")
+            result = "\n".join(lines[1:-1]).strip()
+        
+        logger.info(f"LLM summary generated: {len(result)} characters")
+        
+        if len(result) < 50:
+            logger.warning(f"LLM summary seems too short: {result}")
+            raise Exception("LLM summary too short, using fallback")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        logger.exception("Full traceback:")
+        
+        # Enhanced fallback summary with more details
+        fallback = f"Additionally, {len(items)} other relevant grant opportunities were identified:\n\n"
+        
+        for i, item in enumerate(items[:5], 1):  # Max 5 in fallback
+            if isinstance(item, dict):
+                name = item.get("grant_name", "Unknown Grant")
+                amount = item.get("amount", "N/A")
+                deadline = item.get("deadline", "N/A")
+                agency = item.get("agency", "")
+                
+                # Extract key purpose from description
+                desc = item.get("description", "")
+                if desc:
+                    # Get first sentence as summary
+                    first_sentence = desc.split('.')[0] + '.'
+                    if len(first_sentence) > 350:
+                        first_sentence = first_sentence[:347] + "..."
+                else:
+                    first_sentence = "No description available."
+                
+                # Focus areas
+                focus = item.get("focus_areas", [])
+                if focus and isinstance(focus, list):
+                    focus_str = ", ".join(focus[:3])
+                else:
+                    focus_str = "General"
+                
+                fallback += f"• **{name}**"
+                if isinstance(amount, (int, float)):
+                    fallback += f" (${amount:,})"
+                elif amount != "N/A":
+                    fallback += f" ({amount})"
+                
+                if agency:
+                    fallback += f" - {agency}"
+                
+                fallback += f"\n  {first_sentence}"
+                fallback += f"\n  Focus: {focus_str}"
+                fallback += f" | Deadline: {deadline}\n\n"
+        
+        if len(items) > 5:
+            fallback += f"...and {len(items) - 5} more grants.\n"
+        
+        return fallback.strip()
+
 
 
 # --- Initialize AgenticMemorySystem ---
@@ -1070,139 +1274,358 @@ memory_system = AgenticMemorySystem(
 
 # --- API Endpoints ---
 
-@app.post("/optimize/onboarding_to_matching")
-async def optimize_onboarding_to_matching(payload: OptimizeOnboardToMatchRequest = Body(...)):
+@app.post("/optimize/Optimization")
+async def optimize_onboarding_to_matching(
+    payload: OptimizeOnboardToMatchRequest, 
+    current_user: str = Depends(get_current_user)
+):
     """
-    Return a compact, matcher-friendly package from onboarding memories:
-    - Returns requested selectors verbatim from top results
-    - Summarizes the rest
-    - Optionally filters to grant-type memories and discards irrelevant grants
+    Onboarding -> Matching optimizer with fixed similarity and search.
     """
     try:
-        # Build search query (session filter shorthand)
-        q = payload.query
+        import json
+        
+        # Debug object
+        debug = {
+            "payload_selectors": payload.selectors or [],
+            "payload_grant_threshold": payload.grant_relevance_threshold,
+            "payload_top_k": payload.top_k,
+            "payload_grant_only": payload.grant_only,
+            "search_query": payload.query,
+        }
+
+        # --- 1. Build search query - FIX: Don't combine session filter with text query ---
+        # The search() method handles session_key: syntax specially
+        # So we should search within the session, not add text to it
+        
         if payload.session_filter:
-            # memory_system.search understands "session_key:XYZ" style filters
-            q = f"session_key:{payload.session_filter} {q}"
-
-        # Retrieve top-k candidates
-        search_out = memory_system.search(q, payload.top_k)
-        metas = []
-        if search_out and "metadatas" in search_out and search_out["metadatas"]:
-            metas = search_out["metadatas"][0]
+            # Search within this session only
+            q = f"session_key:{payload.session_filter}"
+            debug["search_strategy"] = "session_filter_only"
         else:
-            metas = []
+            # Use the text query
+            q = payload.query or "grant"
+            debug["search_strategy"] = "text_query"
+        
+        debug["actual_search_query"] = q
+        
+        # --- 2. Execute search ---
+        try:
+            # Get more results than needed to allow for filtering
+            search_results = memory_system.search(q, k=payload.top_k * 5)
+            debug["search_returned_count"] = len(search_results)
+        except Exception as e:
+            debug["search_exception"] = str(e)
+            import traceback
+            debug["search_traceback"] = traceback.format_exc()
+            return {
+                "status": "ok", 
+                "selected": [], 
+                "summary": "", 
+                "meta": {
+                    "requested_query": payload.query, 
+                    "session_filter": payload.session_filter, 
+                    "returned_count": 0, 
+                    "original_candidates": [], 
+                    "debug": debug
+                }
+            }
 
-        # If user wants only grants, filter by memory_type/category/tags
+        if not search_results:
+            debug["no_search_results"] = True
+            return {
+                "status": "ok",
+                "selected": [],
+                "summary": "",
+                "meta": {
+                    "requested_query": payload.query,
+                    "session_filter": payload.session_filter,
+                    "returned_count": 0,
+                    "original_candidates": [],
+                    "debug": debug
+                }
+            }
+
+        # --- 3. Parse and filter for grants ---
         candidates = []
-        for m in metas:
-            # normalize keys
-            m_type = (m.get("memory_type") or m.get("category") or "").lower()
-            tags = [t.lower() for t in (m.get("tags") or [])] if m.get("tags") else []
-            is_grant = ("grant" in m_type) or ("grant" in tags) or ("grant" in (m.get("keywords") or []))
-            # compute a simple relevance score: if distances present use them; else fallback to search score heuristics
-            score = None
-            # memory_system.search returns distances in search_out["distances"]
-            try:
-                idx = metas.index(m)
-                dists = search_out.get("distances", [[]])[0]
-                score = 1.0 - dists[idx] if dists and idx < len(dists) else None
-            except Exception:
-                score = None
+        parse_errors = []
+        
+        for idx, mem in enumerate(search_results):
+            meta_id = mem.get("id")
+            meta_score = mem.get("score", 0)
+            
+            # FIX: Correct similarity calculation
+            # Azure Search score is typically 0-1 where higher is MORE similar
+            # But your search() returns it as distance (0 = similar, 1 = dissimilar)
+            # Let's handle both cases:
+            
+            if "similarity" in mem:
+                # If similarity is already calculated, use it
+                meta_similarity = mem.get("similarity")
+            else:
+                # Calculate from score
+                # If score is very small (< 0.1), it's probably a distance, so invert it
+                if meta_score < 0.1:
+                    meta_similarity = 1.0 - meta_score
+                else:
+                    # If score is large (> 0.9), it's probably already similarity
+                    meta_similarity = meta_score
+            
+            debug[f"mem_{idx}_raw_score"] = meta_score
+            debug[f"mem_{idx}_calculated_similarity"] = meta_similarity
+            
+            # Check if this is a grant-type memory
+            category = (mem.get("category") or mem.get("memory_type") or "").lower()
+            tags = [str(t).lower() for t in (mem.get("tags") or [])]
+            
+            is_grant_by_category = "grant" in category
+            is_grant_by_tags = any("grant" in t for t in tags)
+            
+            debug[f"mem_{idx}_category"] = category
+            debug[f"mem_{idx}_tags_sample"] = tags[:3] if tags else []
+            debug[f"mem_{idx}_is_grant"] = is_grant_by_category or is_grant_by_tags
+            
+            # If grant_only mode and this isn't a grant, skip it
+            if payload.grant_only and not (is_grant_by_category or is_grant_by_tags):
+                debug[f"mem_{idx}_skipped"] = "not_a_grant"
+                continue
+            
+            # Parse content
+            content_str = mem.get("content", "")
+            content_obj = None
+            
+            if content_str:
+                if isinstance(content_str, dict):
+                    content_obj = content_str
+                elif isinstance(content_str, str):
+                    text = content_str.strip()
+                    if text.startswith("{"):
+                        try:
+                            content_obj = json.loads(text)
+                        except json.JSONDecodeError as je:
+                            parse_errors.append({
+                                "mem_id": meta_id,
+                                "error": str(je),
+                                "preview": text[:100]
+                            })
+                            debug[f"mem_{idx}_parse_error"] = str(je)
+            
+            # Double-check: is the parsed content actually a grant?
+            has_grant_fields = (
+                isinstance(content_obj, dict) and 
+                any(k in content_obj for k in ["grant_id", "grant_name", "amount", "deadline"])
+            )
+            
+            if not has_grant_fields and payload.grant_only:
+                debug[f"mem_{idx}_skipped"] = "no_grant_fields_in_content"
+                continue
+            
+            # Add to candidates
+            candidates.append({
+                "type": "grant" if (is_grant_by_category or is_grant_by_tags or has_grant_fields) else "other",
+                "grant": content_obj if isinstance(content_obj, dict) else {},
+                "raw_content": content_str,
+                "source_meta": {
+                    "id": meta_id,
+                    "score": meta_score,
+                    "similarity": meta_similarity,
+                    "session_key": mem.get("session_key"),
+                    "category": category
+                }
+            })
+            
+            debug[f"mem_{idx}_added_to_candidates"] = True
 
-            if payload.grant_only:
-                if not is_grant:
-                    # discard non-grants
-                    continue
-                # if we have a score threshold, respect it
-                if score is not None and score < payload.grant_relevance_threshold:
-                    # discard low relevance grants
-                    continue
+        debug["parse_errors_count"] = len(parse_errors)
+        debug["candidates_count_after_parse"] = len(candidates)
 
-            # keep candidate
-            candidates.append({**m, "_score": score})
-
-        # Build selected outputs (selectors are keys to keep, e.g. 'customer' or 'intent')
-        selected = []
-        omitted_texts = []
+        # --- 4. Apply relevance threshold ---
+        filtered = []
+        threshold = payload.grant_relevance_threshold
+        
         for c in candidates:
-            # if selectors provided, pull them into a small dict
+            similarity = c["source_meta"]["similarity"]
+            mem_id = c["source_meta"]["id"]
+            
+            # Keep if similarity meets threshold
+            if similarity >= threshold:
+                filtered.append(c)
+                debug[f"kept_{mem_id[:8]}"] = f"similarity={similarity:.3f}>={threshold}"
+            else:
+                debug[f"filtered_{mem_id[:8]}"] = f"similarity={similarity:.3f}<{threshold}"
+        
+        debug["candidates_after_threshold"] = len(filtered)
+        
+        # Limit to top_k
+        candidates = filtered[:payload.top_k]
+        debug["final_candidates_count"] = len(candidates)
+
+        # --- 5. Build selected output (top_k with full content) + collect rest for summary ---
+        selected = []
+        items_for_summary = []  # This will hold the REST (non-selected) items
+        
+        # Split: first top_k get full content, rest get summarized
+        selected_candidates = candidates[:payload.top_k]
+        remaining_candidates = filtered[payload.top_k:]  # These will be summarized
+        
+        # Build selected with FULL content
+        for c in selected_candidates:
+            grant = c["grant"]
+            source_meta = c["source_meta"]
+            raw_content = c["raw_content"]
+            
             if payload.selectors:
+                # Extract only requested fields from parsed grant
                 sel = {}
                 for key in payload.selectors:
-                    if key in c:
-                        sel[key] = c[key]
-                selected.append({"id": c.get("id"), "selected": sel, "_meta": {k: c.get(k) for k in ("memory_type","timestamp","_score")}})
-                # save the non-selected content to omitted for summary
-                omitted_texts.append(c.get("content", "") if c.get("content") else json.dumps({k:v for k,v in c.items() if k not in payload.selectors}))
+                    # Try exact match first
+                    if key in grant:
+                        sel[key] = grant[key]
+                    else:
+                        # Try case-insensitive
+                        for k, v in grant.items():
+                            if k.lower() == key.lower():
+                                sel[key] = v
+                                break
+                
+                selected.append({
+                    "id": grant.get("grant_id") or grant.get("id") or source_meta["id"],
+                    "selected": sel,
+                    "content": raw_content,  # Full original content included
+                    "_meta": {
+                        "score": source_meta["score"],
+                        "similarity": source_meta["similarity"],
+                        "session": source_meta["session_key"],
+                        "category": source_meta["category"]
+                    }
+                })
             else:
-                # no selectors specified: keep small canonical metadata and content
-                selected.append({"id": c.get("id"), "content": c.get("content"), "_meta": {k: c.get(k) for k in ("memory_type","timestamp","_score")}})
-                # but also append full content for summarization if needed
-                omitted_texts.append(c.get("content", ""))
+                # Return full grant object + raw content
+                selected.append({
+                    "id": grant.get("grant_id") or grant.get("id") or source_meta["id"],
+                    "grant": grant,
+                    "content": raw_content,  # Full original content included
+                    "_meta": {
+                        "score": source_meta["score"],
+                        "similarity": source_meta["similarity"],
+                        "session": source_meta["session_key"]
+                    }
+                })
+        
+        # Collect remaining (non-selected) items for summarization
+        for c in remaining_candidates:
+            items_for_summary.append(c["grant"])
 
-        # Summarize omitted parts if requested
-        summary = None
-        if payload.summarize:
-            merged = "\n\n".join([t for t in omitted_texts if t])
-            summary = _call_llm_summarize(merged, payload.summary_max_tokens)
+        debug["selected_count"] = len(selected)
+        debug["items_for_summary_count"] = len(items_for_summary)
+        debug["remaining_candidates_count"] = len(remaining_candidates)
 
+        # --- 6. Generate summary (only for remaining items, not selected ones) ---
+        summary = ""
+        if payload.summarize and items_for_summary:
+            try:
+                debug["attempting_summary"] = True
+                debug["llm_summary_input_count"] = len(items_for_summary)
+                
+                logger.info(f"Attempting to summarize {len(items_for_summary)} grants")
+                
+                summary = _call_llm_summarize(items_for_summary, max_tokens=payload.summary_max_tokens)
+                
+                debug["summary_generated"] = True
+                debug["summary_length"] = len(summary)
+                debug["summary_preview"] = summary[:200] if summary else "empty"
+                
+                logger.info(f"Summary generated: {len(summary)} characters")
+                
+            except Exception as e:
+                debug["summary_error"] = str(e)
+                debug["summary_error_type"] = type(e).__name__
+                logger.exception("Summary generation failed")
+                
+                # Provide a basic fallback summary
+                summary = f"Additionally found {len(items_for_summary)} related grant opportunities. "
+                summary += "LLM summarization failed - check logs for details."
+                
+        elif not items_for_summary:
+            debug["summary_skipped"] = "no_remaining_items_to_summarize"
+            logger.info("No remaining items to summarize (all in selected)")
+        else:
+            debug["summary_skipped"] = "summarize_false"
+            logger.info("Summarization disabled by request")
+
+        # --- 7. Return response ---
         meta = {
             "requested_query": payload.query,
             "session_filter": payload.session_filter,
             "returned_count": len(selected),
-            "original_candidates": len(metas)
+            "original_candidates": [
+                {
+                    "id": m.get("id"),
+                    "category": m.get("category"),
+                    "score": m.get("score"),
+                    "similarity": m.get("similarity")
+                }
+                for m in search_results[:10]
+            ],
+            "debug": debug
         }
 
-        return {"status":"ok", "selected": selected, "summary": summary, "meta": meta}
+        return {
+            "status": "ok",
+            "selected": selected,
+            "summary": summary,
+            "meta": meta
+        }
 
     except Exception as e:
+        logger.exception("Endpoint error")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Endpoint: Matching -> Onboarding ---
-@app.post("/optimize/matching_to_onboarding")
-async def optimize_matching_to_onboarding(payload: OptimizeMatchToOnboardRequest = Body(...)):
+#@app.post("/optimize/matching_to_onboarding")
+#async def optimize_matching_to_onboarding(payload: OptimizeMatchToOnboardRequest = Body(...)):
     """
     Return onboarding-friendly compact package for a matching agent's needs:
     - returns requested selectors verbatim (e.g. contact info, instructions)
     - summarizes the rest so onboarding sees concise context
     """
-    try:
-        q = payload.query
-        if payload.session_filter:
-            q = f"session_key:{payload.session_filter} {q}"
+#    try:
+#        q = payload.query
+        
+        #if payload.session_filter:
+        #    q = f"session_key:{payload.session_filter} {q}"
 
-        search_out = memory_system.search(q, payload.top_k)
-        metas = search_out.get("metadatas", [[]])[0] if search_out else []
+#        search_out = memory_system.search(q, payload.top_k)
+#        metas = search_out.get("metadatas", [[]])[0] if search_out else []
 
-        selected = []
-        omitted_texts = []
-        for m in metas:
+#        selected = []
+#        omitted_texts = []
+#        for m in metas:
             # keep exact fields if requested
-            if payload.selectors:
-                sel = {k: m.get(k) for k in payload.selectors if k in m}
-                selected.append({"id": m.get("id"), "selected": sel, "_meta": {k: m.get(k) for k in ("memory_type","timestamp")}})
-                omitted_texts.append(m.get("content", ""))
-            else:
+#            if payload.selectors:
+#                sel = {k: m.get(k) for k in payload.selectors if k in m}
+#                selected.append({"id": m.get("id"), "selected": sel, "_meta": {k: m.get(k) for k in ("memory_type","timestamp")}})
+#                omitted_texts.append(m.get("content", ""))
+#            else:
                 # default: keep short metadata + content snippet
-                selected.append({"id": m.get("id"), "content_snippet": (m.get("content") or "")[:400], "_meta": {k: m.get(k) for k in ("memory_type","timestamp")}})
-                omitted_texts.append(m.get("content", ""))
+#                selected.append({"id": m.get("id"), "content_snippet": (m.get("content") or "")[:400], "_meta": {k: m.get(k) for k in ("memory_type","timestamp")}})
+#                omitted_texts.append(m.get("content", ""))
 
-        summary = None
-        if payload.summarize:
-            merged = "\n\n".join([t for t in omitted_texts if t])
-            summary = _call_llm_summarize(merged, payload.summary_max_tokens)
+#        summary = None
+#        if payload.summarize:
+#            merged = "\n\n".join([t for t in omitted_texts if t])
+#            summary = _call_llm_summarize(merged, payload.summary_max_tokens)
 
-        meta = {
-            "requested_query": payload.query,
-            "returned_count": len(selected),
-            "original_candidates": len(metas)
-        }
-        return {"status":"ok", "selected": selected, "summary": summary, "meta": meta}
+#        meta = {
+#            "requested_query": payload.query,
+#            "returned_count": len(selected),
+#            "original_candidates": len(metas)
+#        }
+#        return {"status":"ok", "selected": selected, "summary": summary, "meta": meta}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#    except Exception as e:
+#        raise HTTPException(status_code=500, detail=str(e))
     
 
 @app.get("/", include_in_schema=False)
@@ -1358,31 +1781,31 @@ async def search_memories_post(
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/search")
-async def search_memories_get(
-    query: str = Query(..., description="Search query"),
-    k: int = Query(5, description="Number of results"),
-    include_neighbors: bool = Query(False, description="Include linked memories"),
-    current_user: str = Depends(get_current_user)
-):
+#@app.get("/search")
+#async def search_memories_get(
+#    query: str = Query(..., description="Search query"),
+#    k: int = Query(5, description="Number of results"),
+#    include_neighbors: bool = Query(False, description="Include linked memories"),
+#    current_user: str = Depends(get_current_user)
+#):
     """
     Search memories (GET version for simple queries).
     This exposes the RAG functionality.
     """
-    try:
-        if include_neighbors:
-            results = memory_system.search_with_neighbors(query, k)
-        else:
-            results = memory_system.search(query, k)
+#    try:
+#        if include_neighbors:
+#            results = memory_system.search_with_neighbors(query, k)
+#        else:
+#            results = memory_system.search(query, k)
         
-        return {
-            "status": "ok",
-            "query": query,
-            "count": len(results),
-            "results": results
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#        return {
+#            "status": "ok",
+#            "query": query,
+#            "count": len(results),
+#            "results": results
+#        }
+#    except Exception as e:
+#        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/memory/related/{memory_id}")
 async def get_related_memories(
@@ -1576,6 +1999,41 @@ async def trigger_consolidation(current_user: str = Depends(get_current_user)):
 #        }
 #    except Exception as e:
 #        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/memory/search/session/{session_key}")
+async def search_memories_by_session(
+    session_key: str,
+    query: str = Query(..., description="Search query"),
+    k: int = Query(5, description="Number of results"),
+    include_neighbors: bool = Query(False, description="Include linked memories"),
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Search memories within a specific session (GET version).
+    """
+    try:
+        # Build session-filtered query
+        search_query = f"session_key:{session_key}"
+        logger.info(f"Searching within session: {session_key} with query: {query}")
+        
+        if include_neighbors:
+            results = memory_system.search_with_neighbors(search_query, k)
+        else:
+            results = memory_system.search(search_query, k)
+        
+        # Double-check filtering
+        results = [r for r in results if r.get('session_key') == session_key]
+        
+        return {
+            "status": "ok",
+            "query": query,
+            "session_key": session_key,
+            "count": len(results),
+            "results": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/debug/links/{memory_id}")
 async def debug_memory_links(
     memory_id: str,
